@@ -1,32 +1,22 @@
-import re, ast
-from html import escape
+
+import re
 from io import BytesIO
-from typing import Optional
+from typing import Optional, List
 
-from telegram import (
-    MAX_MESSAGE_LENGTH,
-    ParseMode,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from telegram import Message
+from telegram import MAX_MESSAGE_LENGTH, ParseMode, InlineKeyboardMarkup
+from telegram import Message, Update, Bot
 from telegram.error import BadRequest
-from telegram.ext import CommandHandler, MessageHandler, Filters, CallbackQueryHandler
+from telegram.ext import CommandHandler, RegexHandler
 from telegram.ext.dispatcher import run_async
-from telegram.utils.helpers import mention_html
+from telegram.utils.helpers import escape_markdown
 
-import skylee.modules.sql.notes_sql as sql
-from skylee import dispatcher, MESSAGE_DUMP, LOGGER
-from skylee.modules.disable import DisableAbleCommandHandler
-from skylee.modules.helper_funcs.chat_status import user_admin, user_admin_no_reply
-from skylee.modules.helper_funcs.misc import build_keyboard, revert_buttons
-from skylee.modules.helper_funcs.msg_types import get_note_type
-from skylee.modules.helper_funcs.string_handling import (
-    escape_invalid_curly_brackets,
-    markdown_to_html,
-)
-from skylee.modules.helper_funcs.alternate import typing_action
-from skylee.modules.connection import connected
+import tg_bot.modules.sql.notes_sql as sql
+from tg_bot import dispatcher, MESSAGE_DUMP, LOGGER
+from tg_bot.modules.disable import DisableAbleCommandHandler
+from tg_bot.modules.helper_funcs.chat_status import user_admin
+from tg_bot.modules.helper_funcs.misc import build_keyboard, revert_buttons
+from tg_bot.modules.helper_funcs.msg_types import get_note_type
+
 
 FILE_MATCHER = re.compile(r"^###file_id(!photo)?###:(.*?)(?:\s|$)")
 STICKER_MATCHER = re.compile(r"^###sticker(!photo)?###:")
