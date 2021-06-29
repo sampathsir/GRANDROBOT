@@ -1,3 +1,4 @@
+
 import re
 from io import BytesIO
 from typing import Optional, List
@@ -181,7 +182,7 @@ def list_notes(bot: Bot, update: Update):
         if len(msg) + len(note_name) > MAX_MESSAGE_LENGTH:
             update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
             msg = ""
-        msg +</code>= note_name
+        msg += note_name
 
     if msg == "*Notes in chat:*\n":
         update.effective_message.reply_text("No notes in this chat!")
@@ -229,10 +230,8 @@ __help__ = """
  - /get <notename>: get the note with this notename
  - #<notename>: same as /get
  - /notes or /saved: list all saved notes in this chat
-
 If you would like to retrieve the contents of a note without any formatting, use `/get <notename> noformat`. This can \
 be useful when updating a current note.
-
 *Admin only:*
  - /save <notename> <notedata>: saves notedata as a note with name notename
 A button can be added to a note by using standard markdown link syntax - the link should just be prepended with a \
