@@ -1,714 +1,379 @@
-import html
-import random
-import re
-import time
-from typing import List
-from functools import partial
+"""
+MIT License
+Copyright (c) 2021 TheHamkerCat
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
 
-from telegram import Update, Bot, CallbackQuery
-from telegram import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.error import BadRequest
-from telegram.ext import MessageHandler, Filters, CommandHandler, run_async, CallbackQueryHandler, JobQueue
-from telegram.utils.helpers import mention_markdown, mention_html, escape_markdown
+import asyncio
+import os
+from datetime import datetime
+from random import shuffle
 
-import tg_bot.modules.sql.welcome_sql as sql
-from tg_bot import dispatcher, OWNER_ID, DEV_USERS, SUDO_USERS, SUPPORT_USERS, TIGER_USERS, WHITELIST_USERS, LOGGER
-from tg_bot.modules.helper_funcs.chat_status import user_admin, is_user_ban_protected
-from tg_bot.modules.helper_funcs.misc import build_keyboard, revert_buttons
-from tg_bot.modules.helper_funcs.msg_types import get_welcome_type
-from tg_bot.modules.helper_funcs.string_handling import (markdown_parser,
-                                                         escape_invalid_curly_brackets)
-from tg_bot.modules.log_channel import loggable
+from pykeyboard import InlineKeyboard
+from pyrogram import filters
+from pyrogram.errors.exceptions.bad_request_400 import (
+    ChatAdminRequired, UserNotParticipant)
+from pyrogram.types import (ChatPermissions, InlineKeyboardButton,
+                            InlineKeyboardMarkup, Message, User)
 
-VALID_WELCOME_FORMATTERS = ['first', 'last', 'fullname', 'username', 'id', 'count', 'chatname', 'mention']
+from wbb import SUDOERS, WELCOME_DELAY_KICK_SEC, app
+from wbb.core.decorators.errors import capture_err
+from wbb.core.decorators.permissions import adminsOnly
+from wbb.utils.dbfunctions import (captcha_off, captcha_on,
+                                   del_welcome, get_captcha_cache,
+                                   get_welcome, is_captcha_on,
+                                   is_gbanned_user, set_welcome,
+                                   update_captcha_cache)
+from wbb.utils.filter_groups import welcome_captcha_group
+from wbb.utils.functions import generate_captcha
 
-ENUM_FUNC_MAP = {
-    sql.Types.TEXT.value: dispatcher.bot.send_message,
-    sql.Types.BUTTON_TEXT.value: dispatcher.bot.send_message,
-    sql.Types.STICKER.value: dispatcher.bot.send_sticker,
-    sql.Types.DOCUMENT.value: dispatcher.bot.send_document,
-    sql.Types.PHOTO.value: dispatcher.bot.send_photo,
-    sql.Types.AUDIO.value: dispatcher.bot.send_audio,
-    sql.Types.VOICE.value: dispatcher.bot.send_voice,
-    sql.Types.VIDEO.value: dispatcher.bot.send_video
-}
+__MODULE__ = "Greetings"
+__HELP__ = """
+/captcha [ENABLE|DISABLE] - Enable/Disable captcha.
+/set_welcome - Reply this to a message containing correct
+format for a welcome message, check end of this message.
+/del_welcome - Delete the welcome message.
+/get_welcome - Get the welcome message.
+**SET_WELCOME ->**
+The format should be something like below.
+```
+**Hi** {name} Welcome to {chat}
+~ #This separater (~) should be there between text and buttons, remove this comment also
+button=[Duck, https://duckduckgo.com]
+button2=[Github, https://github.com]
+```
+**NOTES ->**
+for /rules, you can do /filter rules to a message
+containing rules of your groups whenever a user
+sends /rules, he'll get the message
+"""
 
-VERIFIED_USER_WAITLIST = {}
 
-# do not async
-def send(update, message, keyboard, backup_message):
+answers_dicc = []
+loop = asyncio.get_running_loop()
+
+
+async def get_initial_captcha_cache():
+    global answers_dicc
+    answers_dicc = await get_captcha_cache()
+    return answers_dicc
+
+
+loop.create_task(get_initial_captcha_cache())
+
+
+@app.on_message(filters.new_chat_members, group=welcome_captcha_group)
+@capture_err
+async def welcome(_, message: Message):
+    global answers_dicc
+    """ Get cached answers from mongodb in case of bot's been restarted or crashed. """
+    answers_dicc = await get_captcha_cache()
+    """Mute new member and send message with button"""
+    if not await is_captcha_on(message.chat.id):
+        return
+    for member in message.new_chat_members:
+        try:
+            if member.id in SUDOERS:
+                continue  # ignore sudos
+            if await is_gbanned_user(member.id):
+                await message.chat.kick_member(member.id)
+                await message.reply_text(
+                    f"{member.mention} was globally banned, and got removed,"
+                    + " if you think this is a false gban, you can appeal"
+                    + " for this ban in support chat."
+                )
+                continue
+            if member.is_bot:
+                continue  # ignore bots
+            await message.chat.restrict_member(
+                member.id, ChatPermissions()
+            )
+            text = (
+                f"{(member.mention())} Are you human?\n"
+                f"Solve this captcha in {WELCOME_DELAY_KICK_SEC} seconds and 4 attempts or you'll be kicked."
+            )
+        except ChatAdminRequired:
+            return
+        # Generate a captcha image, answers and some wrong answers
+        captcha = generate_captcha()
+        captcha_image = captcha[0]
+        captcha_answer = captcha[1]
+        wrong_answers = captcha[2]  # This consists of 8 wrong answers
+        correct_button = InlineKeyboardButton(
+            f"{captcha_answer}",
+            callback_data=f"pressed_button {captcha_answer} {member.id}",
+        )
+        temp_keyboard_1 = [correct_button]  # Button row 1
+        temp_keyboard_2 = []  # Botton row 2
+        temp_keyboard_3 = []
+        for i in range(2):
+            temp_keyboard_1.append(
+                InlineKeyboardButton(
+                    f"{wrong_answers[i]}",
+                    callback_data=f"pressed_button {wrong_answers[i]} {member.id}",
+                )
+            )
+        for i in range(2, 5):
+            temp_keyboard_2.append(
+                InlineKeyboardButton(
+                    f"{wrong_answers[i]}",
+                    callback_data=f"pressed_button {wrong_answers[i]} {member.id}",
+                )
+            )
+        for i in range(5, 8):
+            temp_keyboard_3.append(
+                InlineKeyboardButton(
+                    f"{wrong_answers[i]}",
+                    callback_data=f"pressed_button {wrong_answers[i]} {member.id}",
+                )
+            )
+
+        shuffle(temp_keyboard_1)
+        keyboard = [temp_keyboard_1, temp_keyboard_2, temp_keyboard_3]
+        shuffle(keyboard)
+        verification_data = {
+            "chat_id": message.chat.id,
+            "user_id": member.id,
+            "answer": captcha_answer,
+            "keyboard": keyboard,
+            "attempts": 0,
+        }
+        keyboard = InlineKeyboardMarkup(keyboard)
+        # Append user info, correct answer and
+        answers_dicc.append(verification_data)
+        # keyboard for later use with callback query
+        button_message = await message.reply_photo(
+            photo=captcha_image,
+            caption=text,
+            reply_markup=keyboard,
+            quote=True,
+        )
+        os.remove(captcha_image)
+        """ Save captcha answers etc in mongodb in case bot gets crashed or restarted. """
+        await update_captcha_cache(answers_dicc)
+        asyncio.create_task(
+            kick_restricted_after_delay(
+                WELCOME_DELAY_KICK_SEC, button_message, member
+            )
+        )
+        await asyncio.sleep(0.5)
+
+
+async def send_welcome_message(callback_query, pending_user_id):
     try:
-        msg = update.effective_message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-    except BadRequest as excp:
-        if excp.message == "Button_url_invalid":
-            msg = update.effective_message.reply_text(markdown_parser(backup_message +
-                                                                      "\nNote: the current message has an invalid url "
-                                                                      "in one of its buttons. Please update."),
-                                                      parse_mode=ParseMode.MARKDOWN)
-        elif excp.message == "Unsupported url protocol":
-            msg = update.effective_message.reply_text(markdown_parser(backup_message +
-                                                                      "\nNote: the current message has buttons which "
-                                                                      "use url protocols that are unsupported by "
-                                                                      "telegram. Please update."),
-                                                      parse_mode=ParseMode.MARKDOWN)
-        elif excp.message == "Wrong url host":
-            msg = update.effective_message.reply_text(markdown_parser(backup_message +
-                                                                      "\nNote: the current message has some bad urls. "
-                                                                      "Please update."),
-                                                      parse_mode=ParseMode.MARKDOWN)
-            LOGGER.warning(message)
-            LOGGER.warning(keyboard)
-            LOGGER.exception("Could not parse! got invalid url host errors")
-        else:
-            msg = update.effective_message.reply_text(markdown_parser(backup_message +
-                                                                      "\nNote: An error occured when sending the "
-                                                                      "custom message. Please update."),
-                                                      parse_mode=ParseMode.MARKDOWN)
-            LOGGER.exception()
+        raw_text = await get_welcome(callback_query.message.chat.id)
+    except TypeError:
+        return
+    raw_text = raw_text.strip().replace("`", "")
+    if not raw_text:
+        return
+    text = raw_text.split("~")[0].strip()
+    buttons_text_list = raw_text.split("~")[1].strip().splitlines()
+    if "{chat}" in text:
+        text = text.replace(
+            "{chat}", callback_query.message.chat.title
+        )
+    if "{name}" in text:
+        text = text.replace(
+            "{name}", (await app.get_users(pending_user_id)).mention
+        )
+    buttons = InlineKeyboard(row_width=2)
+    list_of_buttons = []
+    for button_string in buttons_text_list:
+        button_string = button_string.strip().split("=")[1].strip()
+        button_string = button_string.replace("[", "").strip()
+        button_string = button_string.replace("]", "").strip()
+        button_string = button_string.split(",")
+        button_text = button_string[0].strip()
+        button_url = button_string[1].strip()
+        list_of_buttons.append(
+            InlineKeyboardButton(text=button_text, url=button_url)
+        )
+    buttons.add(*list_of_buttons)
+    await app.send_message(
+        callback_query.message.chat.id,
+        text=text,
+        reply_markup=buttons,
+        disable_web_page_preview=True,
+    )
 
-    return msg
 
-
-@run_async
-@loggable
-def new_member(bot: Bot, update: Update, job_queue: JobQueue):
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-
-    should_welc, cust_welcome, welc_type = sql.get_welc_pref(chat.id)
-    welc_mutes = sql.welcome_mutes(chat.id)
-    human_checks = sql.get_human_checks(user.id, chat.id)
-
-    new_members = update.effective_message.new_chat_members
-
-    for new_mem in new_members:
-
-        welcome_log = None
-        sent = None
-        should_mute = True
-        welcome_bool = True
-
-        if should_welc:
-
-            # Give the owner a special welcome
-            if new_mem.id == OWNER_ID:
-                update.effective_message.reply_text("YEAH LEGENDS  IS HERE")
-                welcome_log = (f"{html.escape(chat.title)}\n"
-                               f"#USER_JOINED\n"
-                               f"Bot Owner just joined the chat")
-
-            # Welcome Devs
-            elif new_mem.id in DEV_USERS:
-                update.effective_message.reply_text("YEAH I SEE PRO PLAYER IS HERE!")
-
-            # Welcome Sudos
-            elif new_mem.id in SUDO_USERS:
-                update.effective_message.reply_text("Huh! A Powered just joined! Stay Alert!")
-
-            # Welcome Support
-            elif new_mem.id in SUPPORT_USERS:
-                update.effective_message.reply_text("Hey! A support user joined!")
-
-            # Welcome Whitelisted
-            elif new_mem.id in TIGER_USERS:
-                update.effective_message.reply_text("Oof! A Tiger disaster just joined!")
-
-            # Welcome Tigers
-            elif new_mem.id in WHITELIST_USERS:
-                update.effective_message.reply_text("Oof! A Wolf disaster just joined!")
-
-            # Welcome yourself
-            elif new_mem.id == bot.id:
-                update.effective_message.reply_text("hello 😎 thanks for using me make sure you promote me then i can safe your group for spammers 🥰🥰🥰")
-
-            else:
-                # If welcome message is media, send with appropriate function
-                if welc_type not in (sql.Types.TEXT, sql.Types.BUTTON_TEXT):
-                    ENUM_FUNC_MAP[welc_type](chat.id, cust_welcome)
-                    continue
-
-                # else, move on
-                first_name = new_mem.first_name or "PersonWithNoName"  # edge case of empty name - occurs for some bugs.
-
-                if cust_welcome:
-                    if cust_welcome == sql.DEFAULT_WELCOME:
-                        cust_welcome = random.choice(sql.DEFAULT_WELCOME_MESSAGES).format(first=escape_markdown(first_name))
-
-                    if new_mem.last_name:
-                        fullname = escape_markdown(f"{first_name} {new_mem.last_name}")
+@app.on_callback_query(filters.regex("pressed_button"))
+async def callback_query_welcome_button(_, callback_query):
+    """After the new member presses the correct button,
+    set his permissions to chat permissions,
+    delete button message and join message.
+    """
+    global answers_dicc
+    data = callback_query.data
+    pressed_user_id = callback_query.from_user.id
+    pending_user_id = int(data.split(None, 2)[2])
+    button_message = callback_query.message
+    answer = data.split(None, 2)[1]
+    if len(answers_dicc) != 0:
+        for i in answers_dicc:
+            if (
+                i["user_id"] == pending_user_id
+                and i["chat_id"] == button_message.chat.id
+            ):
+                correct_answer = i["answer"]
+                keyboard = i["keyboard"]
+    if pending_user_id == pressed_user_id:
+        if answer != correct_answer:
+            await callback_query.answer("Yeah, It's Wrong.")
+            for iii in answers_dicc:
+                if (
+                    iii["user_id"] == pending_user_id
+                    and iii["chat_id"] == button_message.chat.id
+                ):
+                    attempts = iii["attempts"]
+                    if attempts >= 3:
+                        answers_dicc.remove(iii)
+                        await button_message.chat.kick_member(
+                            pending_user_id
+                        )
+                        await asyncio.sleep(1)
+                        await button_message.chat.unban_member(
+                            pending_user_id
+                        )
+                        await button_message.delete()
+                        await update_captcha_cache(answers_dicc)
+                        return
                     else:
-                        fullname = escape_markdown(first_name)
-                    count = chat.get_members_count()
-                    mention = mention_markdown(new_mem.id, escape_markdown(first_name))
-                    if new_mem.username:
-                        username = "@" + escape_markdown(new_mem.username)
-                    else:
-                        username = mention
-
-                    valid_format = escape_invalid_curly_brackets(cust_welcome, VALID_WELCOME_FORMATTERS)
-                    res = valid_format.format(first=escape_markdown(first_name),
-                                              last=escape_markdown(new_mem.last_name or first_name),
-                                              fullname=escape_markdown(fullname), username=username, mention=mention,
-                                              count=count, chatname=escape_markdown(chat.title), id=new_mem.id)
-                    buttons = sql.get_welc_buttons(chat.id)
-                    keyb = build_keyboard(buttons)
-
-                else:
-                    res = random.choice(sql.DEFAULT_WELCOME_MESSAGES).format(first=escape_markdown(first_name))
-                    keyb = []
-
-                backup_message = random.choice(sql.DEFAULT_WELCOME_MESSAGES).format(first=escape_markdown(first_name))
-                keyboard = InlineKeyboardMarkup(keyb)
-
-        else:
-            welcome_bool = False
-            res = None
-            keyboard = None
-            backup_message = None
-
-        # User exceptions from welcomemutes
-        if is_user_ban_protected(chat, new_mem.id, chat.get_member(new_mem.id)) or human_checks:
-            should_mute = False
-        # Join welcome: soft mute
-        if new_mem.is_bot:
-            should_mute = False
-
-        if user.id == new_mem.id:
-            if should_mute:
-                if welc_mutes == "soft":
-                    bot.restrict_chat_member(chat.id, new_mem.id,
-                                             can_send_messages=True,
-                                             can_send_media_messages=False,
-                                             can_send_other_messages=False,
-                                             can_add_web_page_previews=False,
-                                             until_date=(int(time.time() + 24 * 60 * 60)))
-
-                if welc_mutes == "strong":
-                    welcome_bool = False
-                    VERIFIED_USER_WAITLIST.update({
-                        new_mem.id : {
-                            "should_welc" : should_welc,
-                            "status" : False,
-                            "update" : update,
-                            "res" : res,
-                            "keyboard" : keyboard,
-                            "backup_message" : backup_message
-                        }
-                    })
-                    new_join_mem = f"[{escape_markdown(new_mem.first_name)}](tg://user?id={user.id})"
-                    message = msg.reply_text(f"{new_join_mem}, click the button below to prove you're human.\nYou have 160 seconds.",
-                                             reply_markup=InlineKeyboardMarkup([{InlineKeyboardButton(
-                                                 text="Yes, I'm human.",
-                                                 callback_data=f"user_join_({new_mem.id})")}]),
-                                             parse_mode=ParseMode.MARKDOWN)
-                    bot.restrict_chat_member(chat.id, new_mem.id,
-                                             can_send_messages=False,
-                                             can_send_media_messages=False,
-                                             can_send_other_messages=False,
-                                             can_add_web_page_previews=False)
-
-                    job_queue.run_once(
-                        partial(
-                            check_not_bot, new_mem, chat.id, message.message_id
-                        ), 160, name="welcomemute"
-                    )
-
-        if welcome_bool:
-            sent = send(update, res, keyboard, backup_message)
-
-            prev_welc = sql.get_clean_pref(chat.id)
-            if prev_welc:
-                try:
-                    bot.delete_message(chat.id, prev_welc)
-                except BadRequest:
-                    pass
-
-                if sent:
-                    sql.set_clean_welcome(chat.id, sent.message_id)
-
-        if welcome_log:
-            return welcome_log
-
-        return (f"{html.escape(chat.title)}\n"
-                f"#USER_JOINED\n"
-                f"<b>User</b>: {mention_html(user.id, user.first_name)}\n"
-                f"<b>ID</b>: <code>{user.id}</code>")
-
-    return ""
-
-
-def check_not_bot(member, chat_id, message_id, bot, job):
-
-    member_dict = VERIFIED_USER_WAITLIST.pop(member.id)
-    member_status = member_dict.get("status")
-    if not member_status:
-        try:
-            bot.unban_chat_member(chat_id, member.id)
-        except:
-            pass
-
-        try:
-            bot.edit_message_text("*kicks user*\nThey can always rejoin and try.", chat_id=chat_id, message_id=message_id)
-        except:
-            pass
-
-
-@run_async
-def left_member(bot: Bot, update: Update):
-    chat = update.effective_chat
-    user = update.effective_user
-    should_goodbye, cust_goodbye, goodbye_type = sql.get_gdbye_pref(chat.id)
-
-    if user.id == bot.id:
+                        iii["attempts"] += 1
+                        break
+            shuffle(keyboard[0])
+            shuffle(keyboard[1])
+            shuffle(keyboard[2])
+            shuffle(keyboard)
+            keyboard = InlineKeyboardMarkup(keyboard)
+            await button_message.edit(
+                text=button_message.caption.markdown,
+                reply_markup=keyboard,
+            )
+            return
+        await callback_query.answer("Captcha passed successfully!")
+        await button_message.chat.unban_member(pending_user_id)
+        await button_message.delete()
+        if len(answers_dicc) != 0:
+            for ii in answers_dicc:
+                if (
+                    ii["user_id"] == pending_user_id
+                    and ii["chat_id"] == button_message.chat.id
+                ):
+                    answers_dicc.remove(ii)
+                    await update_captcha_cache(answers_dicc)
+        """ send welcome message """
+        await send_welcome_message(callback_query, pending_user_id)
+        return
+    else:
+        await callback_query.answer("This is not for you")
         return
 
-    if should_goodbye:
-        left_mem = update.effective_message.left_chat_member
-        if left_mem:
-            # Ignore bot being kicked
-            if left_mem.id == bot.id:
-                return
 
-            # Give the owner a special goodbye
-            if left_mem.id == OWNER_ID:
-                update.effective_message.reply_text("ooo sed legend is gone")
-                return
-
-            # Give the devs a special goodbye
-            elif left_mem.id in DEV_USERS:
-                update.effective_message.reply_text("See you later at the Hero's Association!")
-                return
-
-            # if media goodbye, use appropriate function for it
-            if goodbye_type != sql.Types.TEXT and goodbye_type != sql.Types.BUTTON_TEXT:
-                ENUM_FUNC_MAP[goodbye_type](chat.id, cust_goodbye)
-                return
-
-            first_name = left_mem.first_name or "PersonWithNoName"  # edge case of empty name - occurs for some bugs.
-            if cust_goodbye:
-                if cust_goodbye == sql.DEFAULT_GOODBYE:
-                    cust_goodbye = random.choice(sql.DEFAULT_GOODBYE_MESSAGES).format(first=escape_markdown(first_name))
-                if left_mem.last_name:
-                    fullname = escape_markdown(f"{first_name} {left_mem.last_name}")
-                else:
-                    fullname = escape_markdown(first_name)
-                count = chat.get_members_count()
-                mention = mention_markdown(left_mem.id, first_name)
-                if left_mem.username:
-                    username = "@" + escape_markdown(left_mem.username)
-                else:
-                    username = mention
-
-                valid_format = escape_invalid_curly_brackets(cust_goodbye, VALID_WELCOME_FORMATTERS)
-                res = valid_format.format(first=escape_markdown(first_name),
-                                          last=escape_markdown(left_mem.last_name or first_name),
-                                          fullname=escape_markdown(fullname), username=username, mention=mention,
-                                          count=count, chatname=escape_markdown(chat.title), id=left_mem.id)
-                buttons = sql.get_gdbye_buttons(chat.id)
-                keyb = build_keyboard(buttons)
-
-            else:
-                res = random.choice(sql.DEFAULT_GOODBYE_MESSAGES).format(first=first_name)
-                keyb = []
-
-            keyboard = InlineKeyboardMarkup(keyb)
-
-            send(update, res, keyboard, random.choice(sql.DEFAULT_GOODBYE_MESSAGES).format(first=first_name))
+async def kick_restricted_after_delay(
+    delay, button_message: Message, user: User
+):
+    """If the new member is still restricted after the delay, delete
+    button message and join message and then kick him
+    """
+    global answers_dicc
+    await asyncio.sleep(delay)
+    join_message = button_message.reply_to_message
+    group_chat = button_message.chat
+    user_id = user.id
+    await join_message.delete()
+    await button_message.delete()
+    if len(answers_dicc) != 0:
+        for i in answers_dicc:
+            if i["user_id"] == user_id:
+                answers_dicc.remove(i)
+                await update_captcha_cache(answers_dicc)
+    await _ban_restricted_user_until_date(
+        group_chat, user_id, duration=delay
+    )
 
 
-@run_async
-@user_admin
-def welcome(bot: Bot, update: Update, args: List[str]):
-    chat = update.effective_chat
-    # if no args, show current replies.
-    if not args or args[0].lower() == "noformat":
-        noformat = True
-        pref, welcome_m, welcome_type = sql.get_welc_pref(chat.id)
-        update.effective_message.reply_text(f"This chat has it's welcome setting set to: `{pref}`.\n"
-                                            f"*The welcome message (not filling the {{}}) is:*",
-                                            parse_mode=ParseMode.MARKDOWN)
-
-        if welcome_type == sql.Types.BUTTON_TEXT:
-            buttons = sql.get_welc_buttons(chat.id)
-            if noformat:
-                welcome_m += revert_buttons(buttons)
-                update.effective_message.reply_text(welcome_m)
-
-            else:
-                keyb = build_keyboard(buttons)
-                keyboard = InlineKeyboardMarkup(keyb)
-
-                send(update, welcome_m, keyboard, sql.DEFAULT_WELCOME)
-
-        else:
-            if noformat:
-                ENUM_FUNC_MAP[welcome_type](chat.id, welcome_m)
-
-            else:
-                ENUM_FUNC_MAP[welcome_type](chat.id, welcome_m, parse_mode=ParseMode.MARKDOWN)
-
-    elif len(args) >= 1:
-        if args[0].lower() in ("on", "yes"):
-            sql.set_welc_preference(str(chat.id), True)
-            update.effective_message.reply_text("Okay! I'll greet members when they join.")
-
-        elif args[0].lower() in ("off", "no"):
-            sql.set_welc_preference(str(chat.id), False)
-            update.effective_message.reply_text("I'll go loaf around and not welcome anyone then.")
-
-        else:
-            update.effective_message.reply_text("I understand 'on/yes' or 'off/no' only!")
+async def _ban_restricted_user_until_date(
+    group_chat, user_id: int, duration: int
+):
+    try:
+        member = await group_chat.get_member(user_id)
+        if member.status == "restricted":
+            until_date = int(datetime.utcnow().timestamp() + duration)
+            await group_chat.kick_member(
+                user_id, until_date=until_date
+            )
+    except UserNotParticipant:
+        pass
 
 
-@run_async
-@user_admin
-def goodbye(bot: Bot, update: Update, args: List[str]):
-    chat = update.effective_chat
-
-    if not args or args[0] == "noformat":
-        noformat = True
-        pref, goodbye_m, goodbye_type = sql.get_gdbye_pref(chat.id)
-        update.effective_message.reply_text(f"This chat has it's goodbye setting set to: `{pref}`.\n"
-                                            f"*The goodbye  message (not filling the {{}}) is:*",
-                                            parse_mode=ParseMode.MARKDOWN)
-
-        if goodbye_type == sql.Types.BUTTON_TEXT:
-            buttons = sql.get_gdbye_buttons(chat.id)
-            if noformat:
-                goodbye_m += revert_buttons(buttons)
-                update.effective_message.reply_text(goodbye_m)
-
-            else:
-                keyb = build_keyboard(buttons)
-                keyboard = InlineKeyboardMarkup(keyb)
-
-                send(update, goodbye_m, keyboard, sql.DEFAULT_GOODBYE)
-
-        else:
-            if noformat:
-                ENUM_FUNC_MAP[goodbye_type](chat.id, goodbye_m)
-
-            else:
-                ENUM_FUNC_MAP[goodbye_type](chat.id, goodbye_m, parse_mode=ParseMode.MARKDOWN)
-
-    elif len(args) >= 1:
-        if args[0].lower() in ("on", "yes"):
-            sql.set_gdbye_preference(str(chat.id), True)
-            update.effective_message.reply_text("Ok!")
-
-        elif args[0].lower() in ("off", "no"):
-            sql.set_gdbye_preference(str(chat.id), False)
-            update.effective_message.reply_text("Ok!")
-
-        else:
-            # idek what you're writing, say yes or no
-            update.effective_message.reply_text("I understand 'on/yes' or 'off/no' only!")
-
-
-@run_async
-@user_admin
-@loggable
-def set_welcome(bot: Bot, update: Update) -> str:
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-
-    text, data_type, content, buttons = get_welcome_type(msg)
-
-    if data_type is None:
-        msg.reply_text("You didn't specify what to reply with!")
-        return ""
-
-    sql.set_custom_welcome(chat.id, content or text, data_type, buttons)
-    msg.reply_text("Successfully set custom welcome message!")
-
-    return (f"<b>{html.escape(chat.title)}:</b>\n"
-            f"#SET_WELCOME\n"
-            f"<b>Admin:</b> {mention_html(user.id, user.first_name)}\n"
-            f"Set the welcome message.")
-
-
-@run_async
-@user_admin
-@loggable
-def reset_welcome(bot: Bot, update: Update) -> str:
-    chat = update.effective_chat
-    user = update.effective_user
-
-    sql.set_custom_welcome(chat.id, sql.DEFAULT_WELCOME, sql.Types.TEXT)
-    update.effective_message.reply_text("Successfully reset welcome message to default!")
-
-    return (f"<b>{html.escape(chat.title)}:</b>\n"
-            f"#RESET_WELCOME\n"
-            f"<b>Admin:</b> {mention_html(user.id, user.first_name)}\n"
-            f"Reset the welcome message to default.")
-
-
-@run_async
-@user_admin
-@loggable
-def set_goodbye(bot: Bot, update: Update) -> str:
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-    text, data_type, content, buttons = get_welcome_type(msg)
-
-    if data_type is None:
-        msg.reply_text("You didn't specify what to reply with!")
-        return ""
-
-    sql.set_custom_gdbye(chat.id, content or text, data_type, buttons)
-    msg.reply_text("Successfully set custom goodbye message!")
-    return (f"<b>{html.escape(chat.title)}:</b>\n"
-            f"#SET_GOODBYE\n"
-            f"<b>Admin:</b> {mention_html(user.id, user.first_name)}\n"
-            f"Set the goodbye message.")
-
-
-@run_async
-@user_admin
-@loggable
-def reset_goodbye(bot: Bot, update: Update) -> str:
-    chat = update.effective_chat
-    user = update.effective_user
-
-    sql.set_custom_gdbye(chat.id, sql.DEFAULT_GOODBYE, sql.Types.TEXT)
-    update.effective_message.reply_text("Successfully reset goodbye message to default!")
-
-    return (f"<b>{html.escape(chat.title)}:</b>\n"
-            f"#RESET_GOODBYE\n"
-            f"<b>Admin:</b> {mention_html(user.id, user.first_name)}\n"
-            f"Reset the goodbye message.")
-
-
-@run_async
-@user_admin
-@loggable
-def welcomemute(bot: Bot, update: Update, args: List[str]) -> str:
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-
-    if len(args) >= 1:
-        if args[0].lower() in ("off", "no"):
-            sql.set_welcome_mutes(chat.id, False)
-            msg.reply_text("I will no longer mute people on joining!")
-            return (f"<b>{html.escape(chat.title)}:</b>\n"
-                    f"#WELCOME_MUTE\n"
-                    f"<b>• Admin:</b> {mention_html(user.id, user.first_name)}\n"
-                    f"Has toggled welcome mute to <b>OFF</b>.")
-        elif args[0].lower() in ["soft"]:
-            sql.set_welcome_mutes(chat.id, "soft")
-            msg.reply_text("I will restrict users' permission to send media for 24 hours.")
-            return (f"<b>{html.escape(chat.title)}:</b>\n"
-                    f"#WELCOME_MUTE\n"
-                    f"<b>• Admin:</b> {mention_html(user.id, user.first_name)}\n"
-                    f"Has toggled welcome mute to <b>SOFT</b>.")
-        elif args[0].lower() in ["strong"]:
-            sql.set_welcome_mutes(chat.id, "strong")
-            msg.reply_text("I will now mute people when they join until they prove they're not a bot.\nThey will have 160seconds before they get kicked.")
-            return (f"<b>{html.escape(chat.title)}:</b>\n"
-                    f"#WELCOME_MUTE\n"
-                    f"<b>• Admin:</b> {mention_html(user.id, user.first_name)}\n"
-                    f"Has toggled welcome mute to <b>STRONG</b>.")
-        else:
-            msg.reply_text("Please enter `off`/`no`/`soft`/`strong`!", parse_mode=ParseMode.MARKDOWN)
-            return ""
+@app.on_message(filters.command("captcha") & ~filters.private)
+@adminsOnly("can_restrict_members")
+async def captcha_state(_, message):
+    usage = "**Usage:**\n/captcha [ENABLE|DISABLE]"
+    if len(message.command) != 2:
+        await message.reply_text(usage)
+        return
+    chat_id = message.chat.id
+    state = message.text.split(None, 1)[1].strip()
+    state = state.lower()
+    if state == "enable":
+        await captcha_on(chat_id)
+        await message.reply_text("Enabled Captcha For New Users.")
+    elif state == "disable":
+        await captcha_off(chat_id)
+        await message.reply_text("Disabled Captcha For New Users.")
     else:
-        curr_setting = sql.welcome_mutes(chat.id)
-        reply = (f"\n Give me a setting!\nChoose one out of: `off`/`no` or `soft` or `strong` only! \n"
-                 f"Current setting: `{curr_setting}`")
-        msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-        return ""
+        await message.reply_text(usage)
 
 
-@run_async
-@user_admin
-@loggable
-def clean_welcome(bot: Bot, update: Update, args: List[str]) -> str:
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not args:
-        clean_pref = sql.get_clean_pref(chat.id)
-        if clean_pref:
-            update.effective_message.reply_text("I should be deleting welcome messages up to two days old.")
-        else:
-            update.effective_message.reply_text("I'm currently not deleting old welcome messages!")
-        return ""
-
-    if args[0].lower() in ("on", "yes"):
-        sql.set_clean_welcome(str(chat.id), True)
-        update.effective_message.reply_text("I'll try to delete old welcome messages!")
-        return (f"<b>{html.escape(chat.title)}:</b>\n"
-                f"#CLEAN_WELCOME\n"
-                f"<b>Admin:</b> {mention_html(user.id, user.first_name)}\n"
-                f"Has toggled clean welcomes to <code>ON</code>.")
-    elif args[0].lower() in ("off", "no"):
-        sql.set_clean_welcome(str(chat.id), False)
-        update.effective_message.reply_text("I won't delete old welcome messages.")
-        return (f"<b>{html.escape(chat.title)}:</b>\n"
-                f"#CLEAN_WELCOME\n"
-                f"<b>Admin:</b> {mention_html(user.id, user.first_name)}\n"
-                f"Has toggled clean welcomes to <code>OFF</code>.")
-    else:
-        update.effective_message.reply_text("I understand 'on/yes' or 'off/no' only!")
-        return ""
+""" WELCOME MESSAGE """
 
 
-@run_async
-def user_button(bot: Bot, update: Update):
-    chat = update.effective_chat
-    user = update.effective_user
-    query = update.callback_query
-    match = re.match(r"user_join_\((.+?)\)", query.data)
-    message = update.effective_message
-    join_user = int(match.group(1))
-
-    if join_user == user.id:
-        member_dict = VERIFIED_USER_WAITLIST.pop(user.id)
-        member_dict["status"] = True
-        VERIFIED_USER_WAITLIST.update({user.id: member_dict})
-        query.answer(text="Yeet! You're a human, unmuted!")
-        bot.restrict_chat_member(chat.id, user.id, can_send_messages=True,
-                                 can_send_media_messages=True,
-                                 can_send_other_messages=True,
-                                 can_add_web_page_previews=True)
-        bot.deleteMessage(chat.id, message.message_id)
-        if member_dict["should_welc"]:
-            sent = send(member_dict["update"], member_dict["res"], member_dict["keyboard"], member_dict["backup_message"])
-
-            prev_welc = sql.get_clean_pref(chat.id)
-            if prev_welc:
-                try:
-                    bot.delete_message(chat.id, prev_welc)
-                except BadRequest:
-                    pass
-
-                if sent:
-                    sql.set_clean_welcome(chat.id, sent.message_id)
-
-    else:
-        query.answer(text="You're not allowed to do this!")
+@app.on_message(filters.command("set_welcome") & ~filters.private)
+@adminsOnly("can_change_info")
+async def set_welcome_func(_, message):
+    usage = "You need to reply to a text, check the Greetings module in /help"
+    if not message.reply_to_message:
+        await message.reply_text(usage)
+        return
+    if not message.reply_to_message.text:
+        await message.reply_text(usage)
+        return
+    chat_id = message.chat.id
+    raw_text = str(message.reply_to_message.text.markdown)
+    await set_welcome(chat_id, raw_text)
+    await message.reply_text(
+        "Welcome message has been successfully set."
+    )
 
 
-WELC_HELP_TXT = ("Your group's welcome/goodbye messages can be personalised in multiple ways. If you want the messages"
-                 " to be individually generated, like the default welcome message is, you can use *these* variables:\n"
-                 " - `{{first}}`: this represents the user's *first* name\n"
-                 " - `{{last}}`: this represents the user's *last* name. Defaults to *first name* if user has no "
-                 "last name.\n"
-                 " - `{{fullname}}`: this represents the user's *full* name. Defaults to *first name* if user has no "
-                 "last name.\n"
-                 " - `{{username}}`: this represents the user's *username*. Defaults to a *mention* of the user's "
-                 "first name if has no username.\n"
-                 " - `{{mention}}`: this simply *mentions* a user - tagging them with their first name.\n"
-                 " - `{{id}}`: this represents the user's *id*\n"
-                 " - `{{count}}`: this represents the user's *member number*.\n"
-                 " - `{{chatname}}`: this represents the *current chat name*.\n"
-                 "\nEach variable MUST be surrounded by `{{}}` to be replaced.\n"
-                 "Welcome messages also support markdown, so you can make any elements bold/italic/code/links. "
-                 "Buttons are also supported, so you can make your welcomes look awesome with some nice intro "
-                 "buttons.\n"
-                 f"To create a button linking to your rules, use this: `[Rules](buttonurl://t.me/{dispatcher.bot.username}?start=group_id)`. "
-                 "Simply replace `group_id` with your group's id, which can be obtained via /id, and you're good to "
-                 "go. Note that group ids are usually preceded by a `-` sign; this is required, so please don't "
-                 "remove it.\n"
-                 "If you're feeling fun, you can even set images/gifs/videos/voice messages as the welcome message by "
-                 "replying to the desired media, and calling /setwelcome.")
-
-WELC_MUTE_HELP_TXT = (
-    "You can get the bot to mute new people who join your group and hence prevent spambots from flooding your group. "
-    "The following options are possible:\n"
-    "- `/welcomemute soft`: restricts new members from sending media for 24 hours.\n"
-    "- `/welcomemute strong`: mutes new members till they tap on a button thereby verifying they're human.\n"
-    "- `/welcomemute off`: turns off welcomemute.\n"
-    "`Note:` Strong mode kicks a user from the chat if they dont verify in 160seconds. They can always rejoin though"
-                     )
-
-@run_async
-@user_admin
-def welcome_help(bot: Bot, update: Update):
-    update.effective_message.reply_text(WELC_HELP_TXT, parse_mode=ParseMode.MARKDOWN)
+@app.on_message(filters.command("del_welcome") & ~filters.private)
+@adminsOnly("can_change_info")
+async def del_welcome_func(_, message):
+    chat_id = message.chat.id
+    await del_welcome(chat_id)
+    await message.reply_text("Welcome message has been deleted.")
 
 
-@run_async
-@user_admin
-def welcome_mute_help(bot: Bot, update: Update):
-    update.effective_message.reply_text(WELC_MUTE_HELP_TXT, parse_mode=ParseMode.MARKDOWN)
-
-
-# TODO: get welcome data from group butler snap
-# def __import_data__(chat_id, data):
-#     welcome = data.get('info', {}).get('rules')
-#     welcome = welcome.replace('$username', '{username}')
-#     welcome = welcome.replace('$name', '{fullname}')
-#     welcome = welcome.replace('$id', '{id}')
-#     welcome = welcome.replace('$title', '{chatname}')
-#     welcome = welcome.replace('$surname', '{lastname}')
-#     welcome = welcome.replace('$rules', '{rules}')
-#     sql.set_custom_welcome(chat_id, welcome, sql.Types.TEXT)
-
-
-def __migrate__(old_chat_id, new_chat_id):
-    sql.migrate_chat(old_chat_id, new_chat_id)
-
-
-def __chat_settings__(chat_id, user_id):
-    welcome_pref, _, _ = sql.get_welc_pref(chat_id)
-    goodbye_pref, _, _ = sql.get_gdbye_pref(chat_id)
-    return "This chat has it's welcome preference set to `{}`.\n" \
-           "It's goodbye preference is `{}`.".format(welcome_pref, goodbye_pref)
-
-
-__help__ = """
-{}
-
-*Admin only:*
- - /welcome <on/off>: enable/disable welcome messages.
- - /welcome: shows current welcome settings.
- - /welcome noformat: shows current welcome settings, without the formatting - useful to recycle your welcome messages!
- - /goodbye -> same usage and args as /welcome.
- - /setwelcome <sometext>: set a custom welcome message. If used replying to media, uses that media.
- - /setgoodbye <sometext>: set a custom goodbye message. If used replying to media, uses that media.
- - /resetwelcome: reset to the default welcome message.
- - /resetgoodbye: reset to the default goodbye message.
- - /cleanwelcome <on/off>: On new member, try to delete the previous welcome message to avoid spamming the chat.
- - /welcomemutehelp: gives information about welcome mutes.
- - /welcomehelp: view more formatting information for custom welcome/goodbye messages.
-""".format(WELC_HELP_TXT)
-
-NEW_MEM_HANDLER = MessageHandler(Filters.status_update.new_chat_members, new_member, pass_job_queue=True)
-LEFT_MEM_HANDLER = MessageHandler(Filters.status_update.left_chat_member, left_member)
-WELC_PREF_HANDLER = CommandHandler("welcome", welcome, pass_args=True, filters=Filters.group)
-GOODBYE_PREF_HANDLER = CommandHandler("goodbye", goodbye, pass_args=True, filters=Filters.group)
-SET_WELCOME = CommandHandler("setwelcome", set_welcome, filters=Filters.group)
-SET_GOODBYE = CommandHandler("setgoodbye", set_goodbye, filters=Filters.group)
-RESET_WELCOME = CommandHandler("resetwelcome", reset_welcome, filters=Filters.group)
-RESET_GOODBYE = CommandHandler("resetgoodbye", reset_goodbye, filters=Filters.group)
-WELCOMEMUTE_HANDLER = CommandHandler("welcomemute", welcomemute, pass_args=True, filters=Filters.group)
-CLEAN_WELCOME = CommandHandler("cleanwelcome", clean_welcome, pass_args=True, filters=Filters.group)
-WELCOME_HELP = CommandHandler("welcomehelp", welcome_help)
-WELCOME_MUTE_HELP = CommandHandler("welcomemutehelp", welcome_mute_help)
-BUTTON_VERIFY_HANDLER = CallbackQueryHandler(user_button, pattern=r"user_join_")
-
-dispatcher.add_handler(NEW_MEM_HANDLER)
-dispatcher.add_handler(LEFT_MEM_HANDLER)
-dispatcher.add_handler(WELC_PREF_HANDLER)
-dispatcher.add_handler(GOODBYE_PREF_HANDLER)
-dispatcher.add_handler(SET_WELCOME)
-dispatcher.add_handler(SET_GOODBYE)
-dispatcher.add_handler(RESET_WELCOME)
-dispatcher.add_handler(RESET_GOODBYE)
-dispatcher.add_handler(CLEAN_WELCOME)
-dispatcher.add_handler(WELCOME_HELP)
-dispatcher.add_handler(WELCOMEMUTE_HANDLER)
-dispatcher.add_handler(BUTTON_VERIFY_HANDLER)
-dispatcher.add_handler(WELCOME_MUTE_HELP)
-
-__mod_name__ = "GREETINGS"
-__command_list__ = ["welcome", "goodbye", "setwelcome", "setgoodbye", "resetwelcome", "resetgoodbye",
-                    "welcomemute", "cleanwelcome", "welcomehelp", "welcomemutehelp"]
-__handlers__ = [NEW_MEM_HANDLER, LEFT_MEM_HANDLER, WELC_PREF_HANDLER, GOODBYE_PREF_HANDLER,
-                SET_WELCOME, SET_GOODBYE, RESET_WELCOME, RESET_GOODBYE, CLEAN_WELCOME,
-                WELCOME_HELP, WELCOMEMUTE_HANDLER, BUTTON_VERIFY_HANDLER, WELCOME_MUTE_HELP]
+@app.on_message(filters.command("get_welcome") & ~filters.private)
+@adminsOnly("can_change_info")
+async def get_welcome_func(_, message):
+    chat_id = message.chat.id
+    welcome_message = await get_welcome(chat_id)
+    await message.reply_text(welcome_message)
